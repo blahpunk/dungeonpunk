@@ -1,6 +1,5 @@
 // engine/src/world.ts
 import type { Dir, EdgeType, PlayerState, ViewCell, WorldView, MinimapCell } from './types.js';
-import { generateChunkMaze, baseEdgeTypeFromChunk } from './maze.js';
 import { stableHash } from './hash.js';
 
 export const CHUNK_SIZE = 64;
@@ -13,8 +12,10 @@ export interface EdgeOverride {
   defaultStateOnReset?: 'unlocked';
 }
 
+export type EdgeQueryPurpose = 'movement' | 'visibility' | 'minimap';
+
 export interface WorldOverlayProvider {
-  getEdgeOverride(levelId: number, x: number, y: number, dir: Dir): EdgeOverride | null;
+  getEdgeOverride(levelId: number, x: number, y: number, dir: Dir, purpose?: EdgeQueryPurpose): EdgeOverride | null;
 }
 
 export interface DiscoveryProvider {
@@ -30,6 +31,8 @@ export interface CooldownState {
   moveReadyAtMs: number;
   turnReadyAtMs: number;
 }
+
+export type MoveDir = Dir | 'F' | 'B';
 
 export function floorDiv(a: number, b: number): number {
   return Math.floor(a / b);
@@ -63,67 +66,44 @@ export class WorldEngine {
     return Math.round(Math.sqrt(dx * dx + dy * dy) * CELL_FEET);
   }
 
-  edgeType(levelId: number, x: number, y: number, dir: Dir): EdgeType {
-    const ov = this.overlay.getEdgeOverride(levelId, x, y, dir);
+  edgeType(levelId: number, x: number, y: number, dir: Dir, purpose: EdgeQueryPurpose = 'movement'): EdgeType {
+    const ov = this.overlay.getEdgeOverride(levelId, x, y, dir, purpose);
     if (ov) return ov.edgeType;
 
-    // Hub safety invariant: hub (0,0) must never be boxed in.
-    // Applies to ALL levels (including level 0), unless an overlay overrides it.
-    //
-    // Force two guaranteed exits (E and S) and their symmetric counterparts.
-    // Overlays, if present, win (handled above).
-
-    // (0,0) <-> (1,0)
-    if (x === 0 && y === 0 && dir === 'E') return 'open';
-    if (x === 1 && y === 0 && dir === 'W') return 'open';
-
-    // (0,0) <-> (0,1)
-    if (x === 0 && y === 0 && dir === 'S') return 'open';
-    if (x === 0 && y === 1 && dir === 'N') return 'open';
-
-    // Base generation is per chunk.
-    const cx = floorDiv(x, CHUNK_SIZE);
-    const cy = floorDiv(y, CHUNK_SIZE);
-    const lx = mod(x, CHUNK_SIZE);
-    const ly = mod(y, CHUNK_SIZE);
-
-    const chunk = generateChunkMaze(this.seed, levelId, cx, cy);
-
-    // Boundary connectivity between chunks: treat borders as open in a deterministic pattern.
-    // This avoids disconnected chunks without needing cross-chunk data.
-    // Rule: every 8 cells, open an inter-chunk boundary passage.
-    // This is applied when querying edges that cross chunk boundaries.
-
-    if (dir === 'E' && lx === CHUNK_SIZE - 1) {
-      return ly % 8 === 0 ? 'open' : 'wall';
-    }
-    if (dir === 'W' && lx === 0) {
-      return ly % 8 === 0 ? 'open' : 'wall';
-    }
-    if (dir === 'S' && ly === CHUNK_SIZE - 1) {
-      return lx % 8 === 0 ? 'open' : 'wall';
-    }
-    if (dir === 'N' && ly === 0) {
-      return lx % 8 === 0 ? 'open' : 'wall';
-    }
-
-    return baseEdgeTypeFromChunk(chunk, lx, ly, dir);
+    // No base generation: unknown space is solid until the overlay writes structure.
+    return 'wall';
   }
 
-  canTraverse(levelId: number, x: number, y: number, dir: Dir): boolean {
-    const e = this.edgeType(levelId, x, y, dir);
+  private canTraverseAbs(levelId: number, x: number, y: number, absDir: Dir): boolean {
+    const e = this.edgeType(levelId, x, y, absDir, 'movement');
     return e === 'open' || e === 'door_unlocked' || e === 'lever_secret';
   }
 
-  move(player: PlayerState, cooldowns: CooldownState): { ok: boolean; reason?: string; player?: PlayerState } {
+  canTraverse(levelId: number, x: number, y: number, face: Dir, moveDir: MoveDir = 'F'): boolean {
+    const absDir = moveDirToAbs(face, moveDir);
+    return this.canTraverseAbs(levelId, x, y, absDir);
+  }
+
+  /**
+   * Movement rules:
+   * - moveDir 'F'/'B' moves relative to current facing without changing facing.
+   * - moveDir 'N'/'E'/'S'/'W' moves in that absolute direction without changing facing.
+   */
+  move(
+    player: PlayerState,
+    cooldowns: CooldownState,
+    moveDir: MoveDir = 'F'
+  ): { ok: boolean; reason?: string; player?: PlayerState } {
     const now = this.time.nowMs();
     if (now < cooldowns.moveReadyAtMs) return { ok: false, reason: 'move_cooldown' };
 
-    if (!this.canTraverse(player.levelId, player.x, player.y, player.face)) {
+    const absDir = moveDirToAbs(player.face, moveDir);
+
+    if (!this.canTraverseAbs(player.levelId, player.x, player.y, absDir)) {
       return { ok: false, reason: 'blocked' };
     }
 
-    const { nx, ny } = step(player.x, player.y, player.face);
+    const { nx, ny } = step(player.x, player.y, absDir);
     const next: PlayerState = { ...player, x: nx, y: ny };
     this.discovery.markDiscovered(next.levelId, next.x, next.y, now);
 
@@ -142,17 +122,16 @@ export class WorldEngine {
     // Visibility: reveal rays in all directions from the current cell.
     const visibleCells = computeOmniRays(this, player, 3);
 
-    // Minimap: discovered cells in radius, with edges computed on-demand so they render
-    // correctly even with a fresh browser session (no local cache).
+    // Minimap: discovered cells in radius, with edges computed WITHOUT triggering generation.
     const discovered = this.discovery.getDiscoveredInRadius(player.levelId, player.x, player.y, 12);
     const minimapCells: MinimapCell[] = discovered.map((c) => ({
       x: c.x,
       y: c.y,
       edges: {
-        N: this.edgeType(player.levelId, c.x, c.y, 'N'),
-        E: this.edgeType(player.levelId, c.x, c.y, 'E'),
-        S: this.edgeType(player.levelId, c.x, c.y, 'S'),
-        W: this.edgeType(player.levelId, c.x, c.y, 'W')
+        N: this.edgeType(player.levelId, c.x, c.y, 'N', 'minimap'),
+        E: this.edgeType(player.levelId, c.x, c.y, 'E', 'minimap'),
+        S: this.edgeType(player.levelId, c.x, c.y, 'S', 'minimap'),
+        W: this.edgeType(player.levelId, c.x, c.y, 'W', 'minimap')
       }
     }));
 
@@ -183,6 +162,16 @@ export function step(x: number, y: number, dir: Dir): { nx: number; ny: number }
   return { nx: x - 1, ny: y };
 }
 
+function oppositeOf(d: Dir): Dir {
+  return d === 'N' ? 'S' : d === 'S' ? 'N' : d === 'E' ? 'W' : 'E';
+}
+
+function moveDirToAbs(face: Dir, moveDir: MoveDir): Dir {
+  if (moveDir === 'F') return face;
+  if (moveDir === 'B') return oppositeOf(face);
+  return moveDir;
+}
+
 function computeOmniRays(engine: WorldEngine, player: PlayerState, depth: number): ViewCell[] {
   const out = new Map<string, ViewCell>();
 
@@ -190,10 +179,10 @@ function computeOmniRays(engine: WorldEngine, player: PlayerState, depth: number
     const k = `${x},${y}`;
     if (out.has(k)) return;
     const edges: Record<Dir, EdgeType> = {
-      N: engine.edgeType(player.levelId, x, y, 'N'),
-      E: engine.edgeType(player.levelId, x, y, 'E'),
-      S: engine.edgeType(player.levelId, x, y, 'S'),
-      W: engine.edgeType(player.levelId, x, y, 'W')
+      N: engine.edgeType(player.levelId, x, y, 'N', 'visibility'),
+      E: engine.edgeType(player.levelId, x, y, 'E', 'visibility'),
+      S: engine.edgeType(player.levelId, x, y, 'S', 'visibility'),
+      W: engine.edgeType(player.levelId, x, y, 'W', 'visibility')
     };
     out.set(k, { x, y, edges });
   };
@@ -206,7 +195,7 @@ function computeOmniRays(engine: WorldEngine, player: PlayerState, depth: number
     let cy = player.y;
 
     for (let d = 0; d < depth; d++) {
-      const forward = engine.edgeType(player.levelId, cx, cy, dir);
+      const forward = engine.edgeType(player.levelId, cx, cy, dir, 'visibility');
 
       // Fog/LoS rule:
       // - open + lever_secret allow vision to continue

@@ -1,3 +1,5 @@
+// client/src/main.ts
+
 type WsMsg = any;
 
 type DevLoginResponse = {
@@ -63,6 +65,10 @@ function connect(sessionToken: string) {
 
     if (msg.type === 'auth_ok') {
       setStatus('authenticated');
+      try {
+        (document.activeElement as HTMLElement | null)?.blur?.();
+      } catch {}
+      focusGameSurface();
       return;
     }
     if (msg.type === 'auth_err') {
@@ -87,26 +93,62 @@ function send(msg: any) {
   ws.send(JSON.stringify({ ...msg, seq: seq++ }));
 }
 
+function normalizeEdges(v: any): CellEdges {
+  if (!v || typeof v !== 'object') return {};
+  const out: CellEdges = {};
+  for (const [k, val] of Object.entries(v)) {
+    if (val === null || val === undefined) continue;
+    out[String(k)] = String(val);
+  }
+  return out;
+}
+
+function mergeCell(level: number, x: number, y: number, edges: CellEdges) {
+  const k = key(level, x, y);
+  const prev = discovered.get(k);
+  if (!prev) {
+    discovered.set(k, { level, x, y, edges });
+    return;
+  }
+
+  const merged: CellEdges = { ...(prev.edges ?? {}) };
+  for (const [ek, ev] of Object.entries(edges ?? {})) {
+    if (ev === null || ev === undefined) continue;
+    merged[ek] = String(ev);
+  }
+  discovered.set(k, { level, x, y, edges: merged });
+}
+
 function mergeDiscovered(s: any) {
   const you = s?.you;
   if (!you) return;
 
   const level = Number(you.level ?? you.levelId ?? 1);
 
-  // merge minimap patch (server-discovered)
-  const patch: VisibleCell[] = Array.isArray(s.minimap_patch) ? s.minimap_patch : [];
-  for (const c of patch) {
+  // Server sends `minimap_cells` (ws.ts). Accept a couple aliases defensively.
+  const minimapCells: VisibleCell[] = Array.isArray(s.minimap_cells)
+    ? s.minimap_cells
+    : Array.isArray(s.minimapCells)
+      ? s.minimapCells
+      : Array.isArray(s.minimap_patch)
+        ? s.minimap_patch
+        : [];
+
+  for (const c of minimapCells) {
     if (typeof c?.x !== 'number' || typeof c?.y !== 'number') continue;
-    const edges: CellEdges = c.edges && typeof c.edges === 'object' ? c.edges : {};
-    discovered.set(key(level, c.x, c.y), { level, x: c.x, y: c.y, edges });
+    mergeCell(level, c.x, c.y, normalizeEdges(c.edges));
   }
 
-  // merge visible cells (so walls/doors revealed immediately)
-  const vcells: VisibleCell[] = Array.isArray(s.visible_cells) ? s.visible_cells : [];
+  // Merge visible cells (so walls/doors revealed immediately)
+  const vcells: VisibleCell[] = Array.isArray(s.visible_cells)
+    ? s.visible_cells
+    : Array.isArray(s.visibleCells)
+      ? s.visibleCells
+      : [];
+
   for (const c of vcells) {
     if (typeof c?.x !== 'number' || typeof c?.y !== 'number') continue;
-    const edges: CellEdges = c.edges && typeof c.edges === 'object' ? c.edges : {};
-    discovered.set(key(level, c.x, c.y), { level, x: c.x, y: c.y, edges });
+    mergeCell(level, c.x, c.y, normalizeEdges(c.edges));
   }
 }
 
@@ -222,7 +264,6 @@ function drawMinimap(s: any) {
   const youY = Number(you.y);
   const face = String(you.face ?? 'N');
 
-  // Bigger cells for visibility
   const cellPx = 22;
   const halfCellsX = Math.floor(canvas.width / (2 * cellPx));
   const halfCellsY = Math.floor(canvas.height / (2 * cellPx));
@@ -230,7 +271,6 @@ function drawMinimap(s: any) {
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Draw discovered cells + walls/doors/levers
   for (const cell of discovered.values()) {
     if (cell.level !== level) continue;
 
@@ -274,7 +314,6 @@ function drawMinimap(s: any) {
     }
   }
 
-  // Blue X for hub (always, even if not discovered)
   const hx = Number(hub.x ?? 0);
   const hy = Number(hub.y ?? 0);
   const hubDx = hx - youX;
@@ -285,11 +324,28 @@ function drawMinimap(s: any) {
     drawBlueX(px, py, Math.floor(cellPx / 3));
   }
 
-  // Player marker (arrow) at center
   const cx = halfCellsX * cellPx + Math.floor(cellPx / 2);
   const cy = halfCellsY * cellPx + Math.floor(cellPx / 2);
   drawPlayerArrow(cx, cy, face, Math.max(6, Math.floor(cellPx / 3)));
 }
+
+// --- Keyboard handling (arrow keys) ---
+function focusGameSurface() {
+  canvas.tabIndex = 0;
+  try {
+    canvas.focus({ preventScroll: true });
+    return;
+  } catch {}
+  try {
+    document.body.tabIndex = 0;
+    document.body.focus({ preventScroll: true });
+  } catch {}
+}
+
+canvas.addEventListener('pointerdown', () => focusGameSurface());
+mainEl.addEventListener('pointerdown', () => focusGameSurface());
+
+queueMicrotask(() => focusGameSurface());
 
 loginBtn.onclick = async () => {
   try {
@@ -298,6 +354,12 @@ loginBtn.onclick = async () => {
     const r = await devLogin(email);
 
     setStatus('got session token, connecting...');
+    try {
+      emailEl.blur();
+      loginBtn.blur();
+    } catch {}
+    focusGameSurface();
+
     connect(r.sessionToken);
   } catch (e: any) {
     setStatus(`login failed: ${e?.message ?? String(e)}`);
@@ -324,23 +386,29 @@ function sendMoveBackward() {
   send({ type: 'move', payload: { dir: 'B' } });
 }
 
-document.addEventListener('keydown', (ev) => {
-  if (!lastState) return;
+window.addEventListener(
+  'keydown',
+  (ev) => {
+    if (!lastState) return;
 
-  if (ev.key === 'ArrowLeft') {
-    ev.preventDefault();
-    sendTurnLeft();
-  } else if (ev.key === 'ArrowRight') {
-    ev.preventDefault();
-    sendTurnRight();
-  } else if (ev.key === 'ArrowUp') {
-    ev.preventDefault();
-    sendMoveForward();
-  } else if (ev.key === 'ArrowDown') {
-    ev.preventDefault();
-    sendMoveBackward();
-  }
-});
+    if (ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+
+    if (ev.key === 'ArrowLeft') {
+      ev.preventDefault();
+      sendTurnLeft();
+    } else if (ev.key === 'ArrowRight') {
+      ev.preventDefault();
+      sendTurnRight();
+    } else if (ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      sendMoveForward();
+    } else if (ev.key === 'ArrowDown') {
+      ev.preventDefault();
+      sendMoveBackward();
+    }
+  },
+  { capture: true }
+);
 
 for (const btn of Array.from(document.querySelectorAll('button[data-move]'))) {
   btn.addEventListener('click', () => {

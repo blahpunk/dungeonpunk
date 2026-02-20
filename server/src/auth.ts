@@ -9,24 +9,22 @@ function ensureWorld(db: DB): string {
   const worldId = id('w');
   const now = Date.now();
 
-  // Stable seed if provided, otherwise create a new one on first boot after wipe.
-  const forced = process.env.WORLD_SEED;
-  const seed = forced ? Number(forced) : ((Date.now() ^ (Math.random() * 0x7fffffff)) | 0);
+  // If WORLD_SEED is set to a number, use it. If unset or "random", generate a new seed.
+  const raw = String(process.env.WORLD_SEED ?? '').trim().toLowerCase();
+  const useForced = raw !== '' && raw !== 'random' && Number.isFinite(Number(raw));
+  const seed = useForced ? Number(raw) : ((Date.now() ^ (Math.random() * 0x7fffffff)) | 0);
 
   db.prepare('INSERT INTO worlds(world_id, seed, generator_version, created_at_ms) VALUES (?,?,?,?)').run(
     worldId,
     seed,
-    'maze_v1',
+    'doors_v1',
     now
   );
 
   return worldId;
 }
 
-export function devLogin(
-  db: DB,
-  email: string
-): { sessionToken: string; userId: string; characterId: string; worldId: string } {
+export function devLogin(db: DB, email: string): { sessionToken: string; userId: string; characterId: string; worldId: string } {
   const now = Date.now();
   const expiresAt = now + 1000 * 60 * 60 * 24 * 7;
 
@@ -40,7 +38,6 @@ export function devLogin(
   }
   const userId = String(user.user_id);
 
-  // Load most recent character
   let character = db
     .prepare('SELECT character_id FROM characters WHERE user_id = ? ORDER BY last_played_at DESC LIMIT 1')
     .get(userId) as any;
@@ -50,34 +47,69 @@ export function devLogin(
     const name = email.split('@')[0].slice(0, 16);
 
     db.prepare(
-      `INSERT INTO characters(
-        character_id, user_id, world_id, name,
-        hp, last_played_at, level_id, x, y, face,
-        created_at_ms, updated_at_ms
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).run(characterId, userId, worldId, name, 100, now, 1, 0, 0, 'N', now, now);
+      `
+      INSERT INTO characters(character_id, user_id, world_id, name, level_id, x, y, face, hp, last_played_at, created_at_ms, updated_at_ms)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    `
+    ).run(characterId, userId, worldId, name, 1, 0, 0, 'N', 100, now, now, now);
 
+    // Ensure character_position exists immediately (so progress saving always works)
     db.prepare(
-      `INSERT INTO character_position(character_id, world_id, level_id, x, y, face, updated_at_ms)
-       VALUES (?,?,?,?,?,?,?)`
+      `
+      INSERT INTO character_position(character_id, world_id, level_id, x, y, face, updated_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(character_id) DO UPDATE SET
+        world_id = excluded.world_id,
+        level_id = excluded.level_id,
+        x = excluded.x,
+        y = excluded.y,
+        face = excluded.face,
+        updated_at_ms = excluded.updated_at_ms
+    `
     ).run(characterId, worldId, 1, 0, 0, 'N', now);
 
     character = { character_id: characterId };
   } else {
-    // Touch last_played_at
-    db.prepare('UPDATE characters SET last_played_at = ?, updated_at_ms = ? WHERE character_id = ?').run(
-      now,
-      now,
-      String(character.character_id)
-    );
+    // Also make sure character_position row exists for existing characters (legacy DBs)
+    const characterId = String(character.character_id);
+    const cp = db.prepare('SELECT character_id FROM character_position WHERE character_id = ? LIMIT 1').get(characterId) as any;
+    if (!cp) {
+      const cRow = db
+        .prepare('SELECT world_id, level_id, x, y, face FROM characters WHERE character_id = ? LIMIT 1')
+        .get(characterId) as any;
+
+      db.prepare(
+        `
+        INSERT INTO character_position(character_id, world_id, level_id, x, y, face, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(character_id) DO UPDATE SET
+          world_id = excluded.world_id,
+          level_id = excluded.level_id,
+          x = excluded.x,
+          y = excluded.y,
+          face = excluded.face,
+          updated_at_ms = excluded.updated_at_ms
+      `
+      ).run(
+        characterId,
+        String(cRow?.world_id ?? worldId),
+        Number(cRow?.level_id ?? 1),
+        Number(cRow?.x ?? 0),
+        Number(cRow?.y ?? 0),
+        String(cRow?.face ?? 'N'),
+        now
+      );
+    }
   }
 
   const characterId = String(character.character_id);
 
-  const sessionToken = token();
+  const sessionToken = token('s');
   db.prepare(
-    `INSERT INTO sessions(session_token, user_id, created_at_ms, expires_at, last_seen_at)
-     VALUES (?,?,?,?,?)`
+    `
+    INSERT INTO sessions(session_token, user_id, created_at_ms, expires_at, last_seen_at)
+    VALUES (?,?,?,?,?)
+  `
   ).run(sessionToken, userId, now, expiresAt, now);
 
   return { sessionToken, userId, characterId, worldId };

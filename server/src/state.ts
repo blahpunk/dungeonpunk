@@ -1,64 +1,48 @@
 // server/src/state.ts
 import type { DB } from './db.js';
 
-function hasColumn(db: DB, table: string, col: string): boolean {
-  try {
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
-    return rows.some((r) => String(r.name) === col);
-  } catch {
-    return false;
+export type ActiveCharacter = {
+  characterId: string;
+  worldId: string;
+  levelId: number;
+  x: number;
+  y: number;
+  face: string;
+  hp: number;
+};
+
+function hasColumn(db: DB, tableName: string, columnName: string): boolean {
+  // sqlite: PRAGMA table_info(table)
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name?: string }>;
+  for (const r of rows) {
+    if (String(r?.name ?? '') === columnName) return true;
   }
+  return false;
 }
 
-// Some branches call this from ws.ts; make it a harmless shim.
-export function makeState() {
-  return {};
-}
-
-export function loadSession(db: DB, sessionToken: string): { ok: boolean; userId?: string } {
-  const hasSessionToken = hasColumn(db, 'sessions', 'session_token');
-  const tokenCol = hasSessionToken ? 'session_token' : 'token';
-
-  const row = db
-    .prepare(`SELECT user_id, expires_at, expires_at_ms FROM sessions WHERE ${tokenCol} = ? LIMIT 1`)
-    .get(sessionToken) as any;
-
-  if (!row) return { ok: false };
-
-  const now = Date.now();
-  const exp = row.expires_at ?? row.expires_at_ms ?? null;
-  if (typeof exp === 'number' && exp > 0 && now > exp) return { ok: false };
-
-  // Touch last_seen_at if present
-  if (hasColumn(db, 'sessions', 'last_seen_at')) {
-    try {
-      db.prepare(`UPDATE sessions SET last_seen_at = ? WHERE ${tokenCol} = ?`).run(now, sessionToken);
-    } catch {
-      // ignore
-    }
-  }
-
-  return { ok: true, userId: String(row.user_id) };
-}
-
-export function loadActiveCharacter(
-  db: DB,
-  userId: string
-): { characterId: string; worldId: string; levelId: number; x: number; y: number; face: string; hp: number } {
-  // Prefer explicit character_position table if it exists.
-  const hasCharPos = true;
-
+export function loadSession(db: DB, sessionToken: string): { userId: string } | null {
   const row = db
     .prepare(
       `
-      SELECT
-        c.character_id as character_id,
-        c.world_id as world_id,
-        cp.level_id as level_id,
-        cp.x as x,
-        cp.y as y,
-        cp.face as face,
-        c.hp as hp
+      SELECT user_id
+      FROM sessions
+      WHERE session_token = ?
+      LIMIT 1
+    `
+    )
+    .get(sessionToken) as any;
+
+  if (!row?.user_id) return null;
+  return { userId: String(row.user_id) };
+}
+
+export function loadActiveCharacter(db: DB, userId: string): ActiveCharacter {
+  // Prefer character_position (authoritative)
+  const row = db
+    .prepare(
+      `
+      SELECT c.character_id, c.hp,
+             cp.world_id, cp.level_id, cp.x, cp.y, cp.face
       FROM characters c
       JOIN character_position cp ON cp.character_id = c.character_id
       WHERE c.user_id = ?
@@ -80,7 +64,7 @@ export function loadActiveCharacter(
     };
   }
 
-  // fallback (should be rare)
+  // Fallback to legacy characters table (should be rare)
   const row2 = db
     .prepare(
       `
@@ -108,39 +92,65 @@ export function loadActiveCharacter(
   };
 }
 
-export function savePosition(db: DB, characterId: string, levelId: number, x: number, y: number, face: string): void {
+export function savePosition(
+  db: DB,
+  characterId: string,
+  worldId: string,
+  levelId: number,
+  x: number,
+  y: number,
+  face: string
+): void {
   const now = Date.now();
 
   const hasUpdatedAtMs = hasColumn(db, 'character_position', 'updated_at_ms');
   const hasUpdatedAt = hasColumn(db, 'character_position', 'updated_at');
 
+  // UPSERT so progress is saved even if character_position row does not exist.
   if (hasUpdatedAtMs) {
     db.prepare(
       `
-      UPDATE character_position
-      SET level_id = ?, x = ?, y = ?, face = ?, updated_at_ms = ?
-      WHERE character_id = ?
+      INSERT INTO character_position(character_id, world_id, level_id, x, y, face, updated_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(character_id) DO UPDATE SET
+        world_id = excluded.world_id,
+        level_id = excluded.level_id,
+        x = excluded.x,
+        y = excluded.y,
+        face = excluded.face,
+        updated_at_ms = excluded.updated_at_ms
     `
-    ).run(levelId, x, y, face, now, characterId);
+    ).run(characterId, worldId, levelId, x, y, face, now);
   } else if (hasUpdatedAt) {
     db.prepare(
       `
-      UPDATE character_position
-      SET level_id = ?, x = ?, y = ?, face = ?, updated_at = ?
-      WHERE character_id = ?
+      INSERT INTO character_position(character_id, world_id, level_id, x, y, face, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(character_id) DO UPDATE SET
+        world_id = excluded.world_id,
+        level_id = excluded.level_id,
+        x = excluded.x,
+        y = excluded.y,
+        face = excluded.face,
+        updated_at = excluded.updated_at
     `
-    ).run(levelId, x, y, face, now, characterId);
+    ).run(characterId, worldId, levelId, x, y, face, now);
   } else {
     db.prepare(
       `
-      UPDATE character_position
-      SET level_id = ?, x = ?, y = ?, face = ?
-      WHERE character_id = ?
+      INSERT INTO character_position(character_id, world_id, level_id, x, y, face)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(character_id) DO UPDATE SET
+        world_id = excluded.world_id,
+        level_id = excluded.level_id,
+        x = excluded.x,
+        y = excluded.y,
+        face = excluded.face
     `
-    ).run(levelId, x, y, face, characterId);
+    ).run(characterId, worldId, levelId, x, y, face);
   }
 
-  // keep characters.last_played_at + updated_at_ms in sync if present
+  // Keep characters.last_played_at + updated_at_ms in sync if present
   const charHasLastPlayed = hasColumn(db, 'characters', 'last_played_at');
   const charHasUpdatedAtMs = hasColumn(db, 'characters', 'updated_at_ms');
 

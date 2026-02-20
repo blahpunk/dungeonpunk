@@ -1,5 +1,6 @@
-# scripts/wipemyass.sh
 #!/usr/bin/env bash
+# scripts/wipemyass.sh
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -7,7 +8,7 @@ SERVER_DIR="$ROOT_DIR/server"
 DB_PATH="$SERVER_DIR/data/dev.sqlite3"
 
 echo "=== Dungeon Reset Script ==="
-echo "Project root: $ROOT_DIR"
+echo "Project root:  $ROOT_DIR"
 echo "Server dir:    $SERVER_DIR"
 echo "Database path: $DB_PATH"
 echo
@@ -22,7 +23,7 @@ echo
 echo "Stopping any running server is recommended before wiping."
 echo
 
-rm -f "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"
+rm -f -- "$DB_PATH" "${DB_PATH}-wal" "${DB_PATH}-shm"
 
 echo "Database files removed (if they existed)."
 echo
@@ -31,7 +32,6 @@ echo
 
 cd "$ROOT_DIR"
 
-# Run migrations by opening the DB using server code.
 DB_PATH="$DB_PATH" npx --yes tsx -e "
 import { openDb } from './server/src/db.ts';
 const db = openDb(process.env.DB_PATH);
@@ -41,9 +41,7 @@ console.log('Schema initialized via migrations at DB_PATH=' + process.env.DB_PAT
 
 echo
 echo "Verifying required tables exist..."
-sqlite3 "$DB_PATH" "
-  SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
-" | sed 's/^/  - /'
+sqlite3 "$DB_PATH" "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;" | sed 's/^/  - /'
 
 REQUIRED_TABLES=(worlds users characters character_position sessions _migrations discovered_cells_global edge_overrides cell_overrides)
 MISSING=0

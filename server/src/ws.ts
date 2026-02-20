@@ -1,5 +1,4 @@
 // server/src/ws.ts
-
 import type { Server as HttpServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { CONFIG } from './config.js';
@@ -9,7 +8,6 @@ import { loadSession, loadActiveCharacter, savePosition } from './state.js';
 import { DbOverlayProvider } from './overlays.js';
 import { DbDiscoveryProvider } from './discovery.js';
 import { WorldEngine } from '@infinite-dungeon/engine';
-import type { Dir } from '@infinite-dungeon/engine';
 
 interface ConnState {
   authed: boolean;
@@ -20,42 +18,45 @@ interface ConnState {
   cooldowns: { moveReadyAtMs: number; turnReadyAtMs: number };
 }
 
-function originAllowed(origin: string | undefined): boolean {
-  if (!origin) return true; // allow non-browser clients
+function normalizeOrigin(origin: string) {
+  return origin.trim().toLowerCase().replace(/\/+$/, '');
+}
+
+function isAllowedDevOrigin(origin: string): boolean {
+  const o = normalizeOrigin(origin);
+
+  // If config explicitly allows '*' then accept anything.
   const allowed = CONFIG.httpOrigins;
   if (allowed.includes('*')) return true;
-  return allowed.includes(origin);
+
+  // Exact config matches (normalized)
+  for (const a of allowed) {
+    if (normalizeOrigin(a) === o) return true;
+  }
+
+  // Common dev origins (helpful if CONFIG.httpOrigins is still the default localhost-only)
+  const defaults = new Set(['http://localhost:5173', 'http://127.0.0.1:5173']);
+  if (defaults.has(o)) return true;
+
+  // Allow your LAN dev host(s) on Vite port 5173
+  // - If you want to be strict, replace this regex with a single exact IP.
+  if (/^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:5173$/.test(o)) return true;
+
+  return false;
 }
 
-function isDir(v: any): v is Dir {
-  return v === 'N' || v === 'E' || v === 'S' || v === 'W';
-}
-
-function oppositeDir(d: Dir): Dir {
-  if (d === 'N') return 'S';
-  if (d === 'S') return 'N';
-  if (d === 'E') return 'W';
-  return 'E';
+function originAllowed(origin: string | undefined): boolean {
+  // Browsers always send Origin. Some non-browser WS clients may not.
+  // Allow missing Origin to avoid breaking local tooling.
+  if (!origin) return true;
+  return isAllowedDevOrigin(origin);
 }
 
 function getWorldSeed(db: DB, worldId: string): number {
-  // Prefer stored per-world seed (changes after wipe because worlds table is recreated).
-  try {
-    const row = db.prepare(`SELECT seed FROM worlds WHERE world_id = ? LIMIT 1`).get(worldId) as any;
-    const s = Number(row?.seed);
-    if (Number.isFinite(s)) return s;
-  } catch {
-    // ignore
-  }
-
-  // Fallback: allow forced deterministic seed via env; otherwise stable default.
-  const forced = process.env.WORLD_SEED;
-  if (forced) {
-    const s = Number(forced);
-    if (Number.isFinite(s)) return s;
-  }
-
-  return 12345;
+  const row = db.prepare('SELECT seed FROM worlds WHERE world_id = ? LIMIT 1').get(worldId) as any;
+  const s = row?.seed;
+  const n = typeof s === 'number' ? s : Number(s);
+  return Number.isFinite(n) ? n : 12345;
 }
 
 export function attachWs(httpServer: HttpServer, db: DB): void {
@@ -65,7 +66,13 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
     const origin = req.headers.origin as string | undefined;
 
     if (!originAllowed(origin)) {
-      console.warn(`[ws] reject origin=${origin ?? '(none)'} allowed=${CONFIG.httpOrigins.join(',')}`);
+      const allowedLabel = [
+        ...CONFIG.httpOrigins,
+        'http://localhost:5173',
+        'http://127.0.0.1:5173',
+        'http://192.168.*.*:5173'
+      ].join(',');
+      console.warn(`[ws] reject origin=${origin ?? '(none)'} allowed=${allowedLabel}`);
       ws.close(1008, 'bad origin');
       return;
     }
@@ -92,6 +99,7 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
       }
 
       const msg = parsed.msg;
+
       if (msg.seq <= state.lastSeq) {
         ws.send(JSON.stringify({ type: 'error', payload: { code: 'bad_seq', message: 'seq must increase', seq: msg.seq } }));
         return;
@@ -104,13 +112,13 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
       }
 
       if (msg.type === 'auth') {
-        const res = loadSession(db, msg.payload.session_token);
-        if (!res.ok) {
+        const sess = loadSession(db, msg.payload.session_token);
+        if (!sess) {
           ws.send(JSON.stringify({ type: 'auth_err', payload: { reason: 'invalid session' } }));
           return;
         }
 
-        const userId = res.userId!;
+        const userId = sess.userId;
         const active = loadActiveCharacter(db, userId);
 
         state.authed = true;
@@ -118,7 +126,6 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
         state.characterId = active.characterId;
         state.worldId = active.worldId;
 
-        // turning is instant => always ready
         state.cooldowns = { moveReadyAtMs: Date.now(), turnReadyAtMs: Date.now() };
 
         ws.send(
@@ -155,33 +162,8 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
           time: { nowMs: () => Date.now() }
         });
 
-        // Support relative movement:
-        // - 'F' => move forward in current facing
-        // - 'B' => move backward (opposite), but keep facing unchanged
-        // - 'N'|'E'|'S'|'W' => move in that direction (also updates facing to that dir)
-        const payloadDir: any = msg.payload.dir;
-
-        const currentFace = (isDir(active.face) ? (active.face as Dir) : 'N') as Dir;
-
-        let moveDir: Dir;
-        let newFace: Dir;
-
-        if (payloadDir === 'F') {
-          moveDir = currentFace;
-          newFace = currentFace;
-        } else if (payloadDir === 'B') {
-          moveDir = oppositeDir(currentFace);
-          newFace = currentFace;
-        } else if (isDir(payloadDir)) {
-          moveDir = payloadDir;
-          newFace = payloadDir;
-        } else {
-          ws.send(JSON.stringify({ type: 'action_result', payload: { ok: false, reason: 'bad_dir', seq: msg.seq } }));
-          return;
-        }
-
-        const playerForMove = { levelId: active.levelId, x: active.x, y: active.y, face: moveDir, hp: active.hp };
-        const r = engine.move(playerForMove, state.cooldowns);
+        const player = { levelId: active.levelId, x: active.x, y: active.y, face: active.face, hp: active.hp };
+        const r = engine.move(player, state.cooldowns, msg.payload.dir);
 
         if (!r.ok || !r.player) {
           ws.send(JSON.stringify({ type: 'action_result', payload: { ok: false, reason: r.reason, seq: msg.seq } }));
@@ -190,26 +172,31 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
 
         state.cooldowns.moveReadyAtMs = now + CONFIG.moveCooldownMs;
 
-        // Persist: position from move result; facing = computed newFace
-        savePosition(db, active.characterId, r.player.levelId, r.player.x, r.player.y, newFace);
+        savePosition(db, active.characterId, state.worldId, r.player.levelId, r.player.x, r.player.y, r.player.face);
 
         ws.send(JSON.stringify({ type: 'action_result', payload: { ok: true, seq: msg.seq } }));
-
         sendWorldState(ws, db, state, {
           ...active,
           levelId: r.player.levelId,
           x: r.player.x,
           y: r.player.y,
-          face: newFace,
+          face: r.player.face,
           hp: r.player.hp
         });
-
         return;
       }
 
       if (msg.type === 'turn') {
-        // instant turn
-        savePosition(db, active.characterId, active.levelId, active.x, active.y, msg.payload.face);
+        const now = Date.now();
+        if (now < state.cooldowns.turnReadyAtMs) {
+          ws.send(JSON.stringify({ type: 'action_result', payload: { ok: false, reason: 'turn_cooldown', seq: msg.seq } }));
+          return;
+        }
+
+        state.cooldowns.turnReadyAtMs = now + CONFIG.turnCooldownMs;
+
+        savePosition(db, active.characterId, state.worldId, active.levelId, active.x, active.y, msg.payload.face);
+
         ws.send(JSON.stringify({ type: 'action_result', payload: { ok: true, seq: msg.seq } }));
         sendWorldState(ws, db, state, { ...active, face: msg.payload.face });
         return;
@@ -239,7 +226,6 @@ function sendWorldState(ws: any, db: DB, state: ConnState, active: any): void {
     time: { nowMs: () => Date.now() }
   });
 
-  // Ensure current cell is discovered.
   discovery.markDiscovered(active.levelId, active.x, active.y, Date.now());
 
   const player = { levelId: active.levelId, x: active.x, y: active.y, face: active.face, hp: active.hp };
@@ -252,29 +238,13 @@ function sendWorldState(ws: any, db: DB, state: ConnState, active: any): void {
     JSON.stringify({
       type: 'world_state',
       payload: {
-        now: view.nowMs,
-        you: { level: player.levelId, x: player.x, y: player.y, face: player.face, hp: player.hp, status: [] },
-        hub: {
-          level: hub.levelId,
-          x: hub.x,
-          y: hub.y,
-          dist_feet: distFeet,
-          direction: approximateDirToHub(active.x, active.y)
-        },
-        visible_cells: view.visibleCells,
-        minimap_patch: view.minimapCells,
-        nearby_entities: [],
+        you: view.you,
+        hub: { level: hub.levelId, x: hub.x, y: hub.y, distFeet, direction: view.you.face },
         cooldowns: view.cooldowns,
-        world_hash: engine.stateHash(player, state.cooldowns)
+        world_hash: engine.stateHash(player, state.cooldowns),
+        visible_cells: view.visibleCells,
+        minimap_cells: view.minimapCells
       }
     })
   );
-}
-
-function approximateDirToHub(x: number, y: number): string {
-  const dx = -x;
-  const dy = -y;
-  if (Math.abs(dx) > Math.abs(dy)) return dx > 0 ? 'E' : 'W';
-  if (Math.abs(dy) > Math.abs(dx)) return dy > 0 ? 'S' : 'N';
-  return dx > 0 ? 'E' : 'W';
 }
