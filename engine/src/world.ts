@@ -207,7 +207,12 @@ function computeOmniRays(engine: WorldEngine, player: PlayerState, depth: number
 
     for (let d = 0; d < depth; d++) {
       const forward = engine.edgeType(player.levelId, cx, cy, dir);
-      if (!(forward === 'open' || forward === 'door_unlocked' || forward === 'lever_secret')) break;
+
+      // Fog/LoS rule:
+      // - open + lever_secret allow vision to continue
+      // - doors (locked OR unlocked) block vision until you pass through them
+      // - walls block vision
+      if (!(forward === 'open' || forward === 'lever_secret')) break;
 
       const n = step(cx, cy, dir);
       cx = n.nx;

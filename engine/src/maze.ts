@@ -83,72 +83,86 @@ export function baseEdgeTypeFromChunk(
   return v === EDGE_DOOR ? 'door_unlocked' : v === EDGE_OPEN ? 'open' : 'wall';
 }
 
+type RoomSize = { w: number; h: number; weight: number };
+
+const ROOM_SIZES: RoomSize[] = [
+  { w: 2, h: 2, weight: 18 },
+  { w: 3, h: 2, weight: 18 },
+  { w: 2, h: 3, weight: 18 },
+  { w: 3, h: 3, weight: 14 },
+  { w: 4, h: 3, weight: 10 },
+  { w: 3, h: 4, weight: 10 },
+  { w: 4, h: 4, weight: 7 },
+  { w: 4, h: 5, weight: 3 },
+  { w: 5, h: 4, weight: 3 }
+];
+
+function pickWeightedRoomSize(rng: XorShift32): { w: number; h: number } {
+  let total = 0;
+  for (const s of ROOM_SIZES) total += s.weight;
+
+  let roll = rng.int(0, total);
+  for (const s of ROOM_SIZES) {
+    roll -= s.weight;
+    if (roll < 0) return { w: s.w, h: s.h };
+  }
+  return { w: 2, h: 2 };
+}
+
 function carveRooms(east: Uint8Array, south: Uint8Array, rng: XorShift32): void {
-  // Reasonable interval: a few attempts per chunk.
-  // Bias toward smaller rooms.
-  const attempts = 10;
+  // More rooms, larger variety.
+  const attempts = 55;
 
   for (let i = 0; i < attempts; i++) {
-    const roll = rng.float01();
+    const { w, h } = pickWeightedRoomSize(rng);
 
-    let w = 2;
-    let h = 2;
-
-    // Weighted sizes: 2x2 common, 2x3 medium, 3x3 rare
-    if (roll < 0.60) {
-      w = 2; h = 2;
-    } else if (roll < 0.90) {
-      // choose 2x3 or 3x2
-      if (rng.int(0, 2) === 0) { w = 2; h = 3; } else { w = 3; h = 2; }
-    } else {
-      w = 3; h = 3;
-    }
-
+    // Keep a 1-cell margin so we don't smash chunk boundaries too hard.
     const x0 = rng.int(1, CHUNK_SIZE - w - 1);
     const y0 = rng.int(1, CHUNK_SIZE - h - 1);
 
-    // Carve internal edges fully open to form a room rectangle
+    // Carve internal edges fully open to form a room rectangle.
     for (let y = y0; y < y0 + h; y++) {
       for (let x = x0; x < x0 + w; x++) {
         // open east inside room
-        if (x < x0 + w - 1) {
-          setEast(east, x, y, EDGE_OPEN);
-        }
+        if (x < x0 + w - 1) setEast(east, x, y, EDGE_OPEN);
         // open south inside room
-        if (y < y0 + h - 1) {
-          setSouth(south, x, y, EDGE_OPEN);
-        }
+        if (y < y0 + h - 1) setSouth(south, x, y, EDGE_OPEN);
       }
     }
 
-    // Ensure at least one connection from room to maze by opening one perimeter wall
-    // Pick a random perimeter edge and open it.
-    const side = rng.int(0, 4); // 0=N 1=E 2=S 3=W
-    if (side === 0) {
-      const x = rng.int(x0, x0 + w);
-      const y = y0;
-      // open north: means south edge of cell above
-      if (y > 0) setSouth(south, x, y - 1, EDGE_OPEN);
-    } else if (side === 1) {
-      const x = x0 + w - 1;
-      const y = rng.int(y0, y0 + h);
-      setEast(east, x, y, EDGE_OPEN);
-    } else if (side === 2) {
-      const x = rng.int(x0, x0 + w);
-      const y = y0 + h - 1;
-      setSouth(south, x, y, EDGE_OPEN);
-    } else {
-      const x = x0;
-      const y = rng.int(y0, y0 + h);
-      if (x > 0) setEast(east, x - 1, y, EDGE_OPEN);
+    // Ensure multiple connections from room to maze by opening 1-3 perimeter walls.
+    const openings = 1 + rng.int(0, 3); // 1..3
+    for (let k = 0; k < openings; k++) {
+      const side = rng.int(0, 4); // 0=N 1=E 2=S 3=W
+
+      if (side === 0) {
+        // north opening: south edge of cell above (x, y0-1) becomes open
+        const x = rng.int(x0, x0 + w);
+        const y = y0;
+        if (y > 0) setSouth(south, x, y - 1, EDGE_OPEN);
+      } else if (side === 1) {
+        // east opening: east edge of rightmost column
+        const x = x0 + w - 1;
+        const y = rng.int(y0, y0 + h);
+        setEast(east, x, y, EDGE_OPEN);
+      } else if (side === 2) {
+        // south opening: south edge of bottom row
+        const x = rng.int(x0, x0 + w);
+        const y = y0 + h - 1;
+        setSouth(south, x, y, EDGE_OPEN);
+      } else {
+        // west opening: east edge of cell left of room
+        const x = x0;
+        const y = rng.int(y0, y0 + h);
+        if (x > 0) setEast(east, x - 1, y, EDGE_OPEN);
+      }
     }
   }
 }
 
 function placeDoors(east: Uint8Array, south: Uint8Array, rng: XorShift32): void {
-  // Doors are placed on some open edges; keep it modest.
-  // Deterministic: same chunk always gets same doors.
-  const doorChance = 0.035; // ~0.7% of all edges considered (two arrays) becomes doors
+  // More doors, but still reasonable. Deterministic per chunk.
+  const doorChance = 0.095;
 
   for (let y = 0; y < CHUNK_SIZE; y++) {
     for (let x = 0; x < CHUNK_SIZE; x++) {
