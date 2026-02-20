@@ -21,7 +21,7 @@ interface ConnState {
 }
 
 function originAllowed(origin: string | undefined): boolean {
-  if (!origin) return true;
+  if (!origin) return true; // allow non-browser clients
   const allowed = CONFIG.httpOrigins;
   if (allowed.includes('*')) return true;
   return allowed.includes(origin);
@@ -38,14 +38,24 @@ function oppositeDir(d: Dir): Dir {
   return 'E';
 }
 
-function resolveMoveDir(activeFace: string, payloadDir: any): Dir | null {
-  const face: Dir = isDir(activeFace) ? activeFace : 'N';
+function getWorldSeed(db: DB, worldId: string): number {
+  // Prefer stored per-world seed (changes after wipe because worlds table is recreated).
+  try {
+    const row = db.prepare(`SELECT seed FROM worlds WHERE world_id = ? LIMIT 1`).get(worldId) as any;
+    const s = Number(row?.seed);
+    if (Number.isFinite(s)) return s;
+  } catch {
+    // ignore
+  }
 
-  if (payloadDir === 'F') return face;
-  if (payloadDir === 'B') return oppositeDir(face);
-  if (isDir(payloadDir)) return payloadDir;
+  // Fallback: allow forced deterministic seed via env; otherwise stable default.
+  const forced = process.env.WORLD_SEED;
+  if (forced) {
+    const s = Number(forced);
+    if (Number.isFinite(s)) return s;
+  }
 
-  return null;
+  return 12345;
 }
 
 export function attachWs(httpServer: HttpServer, db: DB): void {
@@ -108,6 +118,7 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
         state.characterId = active.characterId;
         state.worldId = active.worldId;
 
+        // turning is instant => always ready
         state.cooldowns = { moveReadyAtMs: Date.now(), turnReadyAtMs: Date.now() };
 
         ws.send(
@@ -135,23 +146,42 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
           return;
         }
 
-        const moveDir = resolveMoveDir(active.face, msg.payload.dir);
-        if (!moveDir) {
-          ws.send(JSON.stringify({ type: 'action_result', payload: { ok: false, reason: 'bad_move_dir', seq: msg.seq } }));
-          return;
-        }
-
         const overlay = new DbOverlayProvider(db, state.worldId);
         const discovery = new DbDiscoveryProvider(db, state.worldId);
         const engine = new WorldEngine({
-          seed: Number(process.env.WORLD_SEED ?? 12345),
+          seed: getWorldSeed(db, state.worldId),
           overlay,
           discovery,
           time: { nowMs: () => Date.now() }
         });
 
-        const player = { levelId: active.levelId, x: active.x, y: active.y, face: moveDir, hp: active.hp };
-        const r = engine.move(player, state.cooldowns);
+        // Support relative movement:
+        // - 'F' => move forward in current facing
+        // - 'B' => move backward (opposite), but keep facing unchanged
+        // - 'N'|'E'|'S'|'W' => move in that direction (also updates facing to that dir)
+        const payloadDir: any = msg.payload.dir;
+
+        const currentFace = (isDir(active.face) ? (active.face as Dir) : 'N') as Dir;
+
+        let moveDir: Dir;
+        let newFace: Dir;
+
+        if (payloadDir === 'F') {
+          moveDir = currentFace;
+          newFace = currentFace;
+        } else if (payloadDir === 'B') {
+          moveDir = oppositeDir(currentFace);
+          newFace = currentFace;
+        } else if (isDir(payloadDir)) {
+          moveDir = payloadDir;
+          newFace = payloadDir;
+        } else {
+          ws.send(JSON.stringify({ type: 'action_result', payload: { ok: false, reason: 'bad_dir', seq: msg.seq } }));
+          return;
+        }
+
+        const playerForMove = { levelId: active.levelId, x: active.x, y: active.y, face: moveDir, hp: active.hp };
+        const r = engine.move(playerForMove, state.cooldowns);
 
         if (!r.ok || !r.player) {
           ws.send(JSON.stringify({ type: 'action_result', payload: { ok: false, reason: r.reason, seq: msg.seq } }));
@@ -160,21 +190,25 @@ export function attachWs(httpServer: HttpServer, db: DB): void {
 
         state.cooldowns.moveReadyAtMs = now + CONFIG.moveCooldownMs;
 
-        savePosition(db, active.characterId, r.player.levelId, r.player.x, r.player.y, r.player.face);
+        // Persist: position from move result; facing = computed newFace
+        savePosition(db, active.characterId, r.player.levelId, r.player.x, r.player.y, newFace);
 
         ws.send(JSON.stringify({ type: 'action_result', payload: { ok: true, seq: msg.seq } }));
+
         sendWorldState(ws, db, state, {
           ...active,
           levelId: r.player.levelId,
           x: r.player.x,
           y: r.player.y,
-          face: r.player.face,
+          face: newFace,
           hp: r.player.hp
         });
+
         return;
       }
 
       if (msg.type === 'turn') {
+        // instant turn
         savePosition(db, active.characterId, active.levelId, active.x, active.y, msg.payload.face);
         ws.send(JSON.stringify({ type: 'action_result', payload: { ok: true, seq: msg.seq } }));
         sendWorldState(ws, db, state, { ...active, face: msg.payload.face });
@@ -199,12 +233,13 @@ function sendWorldState(ws: any, db: DB, state: ConnState, active: any): void {
   const overlay = new DbOverlayProvider(db, state.worldId!);
   const discovery = new DbDiscoveryProvider(db, state.worldId!);
   const engine = new WorldEngine({
-    seed: Number(process.env.WORLD_SEED ?? 12345),
+    seed: getWorldSeed(db, state.worldId!),
     overlay,
     discovery,
     time: { nowMs: () => Date.now() }
   });
 
+  // Ensure current cell is discovered.
   discovery.markDiscovered(active.levelId, active.x, active.y, Date.now());
 
   const player = { levelId: active.levelId, x: active.x, y: active.y, face: active.face, hp: active.hp };
@@ -219,7 +254,13 @@ function sendWorldState(ws: any, db: DB, state: ConnState, active: any): void {
       payload: {
         now: view.nowMs,
         you: { level: player.levelId, x: player.x, y: player.y, face: player.face, hp: player.hp, status: [] },
-        hub: { level: hub.levelId, x: hub.x, y: hub.y, dist_feet: distFeet, direction: approximateDirToHub(active.x, active.y) },
+        hub: {
+          level: hub.levelId,
+          x: hub.x,
+          y: hub.y,
+          dist_feet: distFeet,
+          direction: approximateDirToHub(active.x, active.y)
+        },
         visible_cells: view.visibleCells,
         minimap_patch: view.minimapCells,
         nearby_entities: [],
