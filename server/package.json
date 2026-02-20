@@ -1,0 +1,25 @@
+{
+  "name": "@infinite-dungeon/server",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "schema:audit": "tsx src/schema_audit.ts"
+  },
+  "dependencies": {
+    "@infinite-dungeon/engine": "*",
+    "better-sqlite3": "^11.7.0",
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/ws": "^8.5.12",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
+  }
+}

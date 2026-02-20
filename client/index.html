@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Infinite Dungeon (Milestone 1)</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+        margin: 24px;
+      }
+      #wrap {
+        display: grid;
+        grid-template-columns: 520px 520px;
+        gap: 24px;
+        align-items: start;
+      }
+      #main {
+        white-space: pre;
+        background: #f5f5f5;
+        padding: 12px;
+        border-radius: 8px;
+        overflow: auto;
+        max-height: 520px;
+      }
+      #meta {
+        white-space: pre;
+        background: #f5f5f5;
+        padding: 12px;
+        border-radius: 8px;
+        overflow: auto;
+      }
+      canvas {
+        border: 1px solid #999;
+        border-radius: 8px;
+        background: #fff;
+      }
+      .btnrow {
+        margin-top: 10px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      button {
+        padding: 6px 10px;
+      }
+      hr {
+        margin: 12px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Infinite Dungeon (Milestone 1)</h1>
+
+    <div>
+      Email (dev login):
+      <input id="email" size="32" />
+      <button id="login">Dev Login</button>
+      <span id="status"> not connected</span>
+    </div>
+
+    <hr />
+
+    <div id="wrap">
+      <div>
+        <h2>Main view</h2>
+        <pre id="main"></pre>
+
+        <div class="btnrow">
+          <button data-move="N">Move N</button>
+          <button data-move="E">Move E</button>
+          <button data-move="S">Move S</button>
+          <button data-move="W">Move W</button>
+        </div>
+
+        <div class="btnrow">
+          <button data-turn="N">Face N</button>
+          <button data-turn="E">Face E</button>
+          <button data-turn="S">Face S</button>
+          <button data-turn="W">Face W</button>
+        </div>
+      </div>
+
+      <div>
+        <h2>Minimap (discovered)</h2>
+        <canvas id="minimap" width="512" height="512"></canvas>
+        <pre id="meta"></pre>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

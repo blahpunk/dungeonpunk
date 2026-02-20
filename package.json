@@ -1,0 +1,19 @@
+{
+  "name": "infinite-dungeon",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "engine",
+    "server",
+    "client"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "npm -w engine run build && npm -w server run build && npm -w client run build",
+    "dev": "npm -w server run dev",
+    "test": "npm -w engine run test && npm -w server run test",
+    "format": "node ./scripts/noop.mjs"
+  }
+}
